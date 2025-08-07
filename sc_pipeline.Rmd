@@ -1,0 +1,308 @@
+---
+title: "Seurat pipeline"
+author: "Hinna"
+date: "2024-09-02"
+output:
+  pdf_document:
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{fontspec}
+  - \setmainfont{SimSun}  
+---
+## 复现Seurat操作
+### 加载包
+```{r}
+library(Seurat)
+library(dplyr)
+library(aplot)
+```
+
+<br>
+
+### 1.设置Seurat对象
+```{r}
+## 读取10x数据
+pbmc.data <- Read10X(data.dir = "E:/pbmc/filtered_gene_bc_matrices/hg19/")
+```
+这里返回一个稀疏矩阵，每一行表示一个gene，每一列表示一个cell；
+对应的单元格就表示某基因在对应细胞的表达量
+
+<br>
+
+```{r}
+##初始化对象
+pbmc <- CreateSeuratObject(counts = pbmc.data, project = "pbmc3k", min.cells = 3, min.features = 200)
+pbmc
+class(GetAssayData(pbmc, layer = "counts"))
+```
+
+在这里，`min.cells = 3`过滤了少于在三个细胞表达的基因；
+`min.features = 200`过滤了少于200个表达的基因的细胞
+
+<br>
+
+### 2.标准预处理工作流程
+### 2.1 QC质控
+```{r}
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+pbmc[["percent.mt"]] |> head()
+```
+`PercentageFeatureSet`计算了对象中线粒体基因的占比，并添加回对象中
+常见的QC指标：（去除低质量细胞） 过滤掉总基因数、总转录本数和线粒体基因比例不在合理范围内的细胞
+
+<br>
+
+可以通过`head(pbmc@meta.data)`来查看QC指标在Seurat对象中的位置：
+```R
+head(pbmc@meta.data,5)
+                 orig.ident nCount_RNA nFeature_RNA percent.mt
+AAACATACAACCAC-1     pbmc3k       2419          779  3.0177759
+AAACATTGAGCTAC-1     pbmc3k       4903         1352  3.7935958
+AAACATTGATCAGC-1     pbmc3k       3147         1129  0.8897363
+AAACCGTGCTTCCG-1     pbmc3k       2639          960  1.7430845
+AAACCGTGTATGCG-1     pbmc3k        980          521  1.2244898
+```
+
+<br>
+
+#### 2.1.1可视化QC指标
+首先，使用小提琴图可视化QC指标：
+```{r}
+# 小提琴图可视化
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+<br>
+
+在这里，`nFeature_RNA`表示细胞中表达的基因数目（表达量大于0的gene量）、`nCount_RNA`表示该细胞基因表达量之和（转录本数目总和）、`percent.mt`表示每个细胞中线粒体基因表达量占总表达量的百分比。使用小提琴图可以看出样本中哪些细胞需要过滤。
+
+<br>
+
+其次，使用散点图可视化不同QC指标之间的相关性：
+```{r}
+p1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+p2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot_list(p1, p2)
+```
+
+<br>
+
+#### 2.1.2 过滤数据
+```{r}
+## 筛选表达量介于200到2500，且线粒体基因表达比例小于5%的细胞
+pbmc <- subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+dim(pbmc)
+```
+
+<br>
+
+### 2.2 规范化数据
+标准化是单细胞 RNA 测序数据分析中的关键步骤，能够有效减少技术噪声，特别是由于不同细胞之间测序深度不一致而带来的偏差。
+```{r}
+# 默认使用LogNormalize方法进行规范化操作
+pbmc <- NormalizeData(pbmc)
+pbmc
+```
+这里的`LogNormalize`方法具体是将每个细胞中的基因表达值（转录本数目）除以该细胞的总表达量，然后乘以 `scale.factor`，最后对每个基因的表达值取对数（通常是自然对数），得到标准化后的表达矩阵。
+
+<br>
+
+### 2.3 特征选择
+在数据集中挑选2000个高变表达基因，这些基因在不同细胞之间有显著的高变表达情况。再挑选top10的高变表达基因，使用散点图可视化top10的HVG结果：
+```{r}
+# 找2000个HVG
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 2000)
+
+# 从中选择top10
+top10 <- head(VariableFeatures(pbmc), 10)
+print(top10)
+
+# 散点图可视化top10的HVG
+p3 <- VariableFeaturePlot(pbmc)
+p4 <- LabelPoints(plot = p3, points = top10, repel = TRUE)
+aplot::plot_list(p3, p4)
+```
+
+<br>
+
+### 2.4 缩放数据
+在前面的`NormalizeData`规范化数据后，这里要进一步进行标准化处理。标准化过程包括将每个基因的表达数据进行中心化和缩放，使得数据具有均值为 0 和标准差为 1。这样的处理步骤通常用于消除基因表达数据中的技术噪声和系统偏差，使得不同基因的表达量在相同的尺度上，从而提高后续分析（如主成分分析 PCA）的有效性。
+```{r}
+# 对所有基因进行标准化处理
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes)
+pbmc
+```
+
+<br>
+
+### 3.1 PCA主成分分析
+应用主成分分析（PCA），以提取和减少数据的维度，主要使用之前识别出的高变异基因作为 PCA 的输入特征。PCA 结果有助于识别数据中的主要变化模式，并在降维后的空间中进行进一步分析（如聚类、可视化等）。
+```{r}
+# 输入HVG进行主成分分析
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc))
+
+# 不同的可视化PCA结果
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+
+## 散点图
+DimPlot(pbmc, reduction = "pca") + NoLegend()
+
+## 热图
+DimHeatmap(pbmc, dims = 1, cells = 500, balanced = TRUE)
+
+## 分组热图
+DimHeatmap(pbmc, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+<br>
+
+<mark> 为什么要用HVG作为PCA的输入？
+
+选择高变异基因作为 PCA 输入特征的主要原因是这些基因在细胞间表现出显著的变化，能够更好地捕捉数据的主要结构和变化模式。这样做不仅能提高计算效率，还能使主成分分析结果更具生物学解释性和代表性，从而为后续的数据分析和解读提供更有用的信息。
+
+<br>
+
+运行时遇到的问题：
+警告: No layers found matching search pattern providedError in PrepDR5():
+! No layer matching pattern 'scale.data' not found. Please run ScaleData and retry  
+在进行 PCA 分析之前，确保数据已经经过缩放和中心化是非常重要的。如果出现 `No layer matching pattern 'scale.data' not found` 的错误，通常意味着 `ScaleData` 函数尚未运行。按照上述步骤进行数据处理，确保所有必要的数据层都已经正确设置后，再次尝试运行 PCA。
+
+<br>
+
+### 3.2 确定数据集的维数
+使用`ElbowPlot`函数可以对每个主成分进行得分排名，以确定主要的成分便于后面的分析：
+```{r}
+ElbowPlot(pbmc)
+```
+可以看到，数据在`PC = 10`的位置逐步平缓，说明共有10个成分有用
+
+<br>
+
+### 3.3 对细胞进行聚类
+```{r}
+# 使用前十个主成分计算细胞之间的相似性
+pbmc <- FindNeighbors(pbmc, dims = 1:10)
+
+# 聚类
+pbmc <- FindClusters(pbmc, resolution = 0.5)
+
+# 查看前5个细胞的cluster ID
+head(Idents(pbmc), 5)
+```
+
+<br>
+
+### 3.4 非线性降维（UMAP/tSNE）
+UMAP 是一种用于将高维数据降维到二维或三维空间的非线性降维技术，常用于单细胞 RNA 测序数据的可视化。
+```{r}
+# 选择前十个成分进行UMAP分析
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+
+# 可视化UMAP的结果
+DimPlot(pbmc, reduction = "umap", label = TRUE)
+```
+
+发现，我的UMAP可视化结果跟流程的不一样。即使输入数据相同，生成的结果(嵌入值)可能会有所不同。这是因为 UMAP 算法在默认情况下包含些随机成分，例如随机初始化和随机邻域选择，这些都会影响最终的嵌入结果。所以，要想得到相同的结果，可以设置种子。
+
+<br>
+
+### 4.1 找marker基因
+marker基因是指在不同cluster中差异表达的基因。比如，这些基因在某cluster中显著表达，而在另外的cluster中表达低。marker基因用于区分不同簇，作为一个标志物。
+```{r}
+## 使用新方法
+source("D:/bioinformatics_learning/R_learning/bc_pipeline/FindAllMarkersPresto.R")
+results <- FindAllMarkersPresto(data = pbmc@assays$RNA$scale.data, group_labels = Idents(pbmc), only.pos = FALSE)
+
+markers <- results %>%
+  dplyr::group_by(group) %>%
+  dplyr::filter(logFC > 0) %>%
+  arrange(desc(logFC)) %>%
+  slice_head(n = 15) %>%
+  ungroup()
+
+
+# 在cluster2中找marker基因
+cluster2.markers <- FindMarkers(pbmc, ident.1 = 2)
+head(cluster2.markers, n = 5)
+```
+
+<br>
+
+还可以通过设定`ident.2`参数来探究某一个cluster和另外的cluster之间差异表达的基因：
+```{r}
+# 在cluster5中找与cluster0和cluster3显著差异表达的基因
+cluster5.markers <- FindMarkers(pbmc, ident.1 = 5, ident.2 = c(0, 3))
+head(cluster5.markers, n = 5)
+```
+
+<br>
+
+还可以找每个簇的差异表达基因
+```{r}
+# 寻找每个cluster中相较于其他cluster的显著差异表达基因，并且是上调的
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE)
+pbmc.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    arrange(desc(avg_log2FC)) %>%
+    slice_head(n = 15) %>%
+    ungroup() -> top15
+```
+这样实际上是将某一个cluster与剩下所有cluster进行比较，分别找出在当前cluster的显著上调基因。
+
+
+<br>
+
+还可以使用不同的测试方法进行差异表达的测试：
+```{r}
+# 识别cluster0的DEG，设置logFC = 0.25的阈值，使用ROC评估
+cluster0.markers <- FindMarkers(pbmc, ident.1 = 0, logfc.threshold = 0.25, test.use = "roc", only.pos = TRUE)
+```
+
+<br>
+
+可视化DEG：
+```{r}
+# 小提琴图可视化
+VlnPlot(pbmc, features = c("MS4A1", "CD79A"))
+
+# 查看原始数据
+VlnPlot(pbmc, features = c("NKG7", "PF4"), slot = "counts", log = TRUE)
+
+# 在UMAP或者tSNE图上绘制不同基因表达图
+FeaturePlot(pbmc, features = c("MS4A1", "GNLY", "CD3E", "CD14", "FCER1A", "FCGR3A", "LYZ", "PPBP",
+    "CD8A"))
+
+# 绘制每个cluster中DEG的热图
+pbmc.markers %>%
+    group_by(cluster) %>% # 根据cluster分组，分别筛选
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 10) %>%
+    ungroup() -> top10 # 汇总成top10表
+DoHeatmap(pbmc, features = top10$gene) + NoLegend()
+```
+
+<br>
+
+### 4.2 根据已有的信息进行细胞亚群注释
+这里的示例数据集已经给出了每个cluster的具体注释，故直接使用：
+```{r}
+# 设置注释名称
+new.cluster.ids <- c("Naive CD4 T", "CD14+ Mono", "Memory CD4 T", "B", "CD8 T", "FCGR3A+ Mono",
+    "NK", "DC", "Platelet")
+
+# 将每个cluster的id与注释名关联
+names(new.cluster.ids) <- levels(pbmc)
+
+# 更新名称
+pbmc <- RenameIdents(pbmc, new.cluster.ids)
+
+
+DimPlot(pbmc, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+
+
+

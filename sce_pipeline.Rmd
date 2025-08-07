@@ -1,0 +1,139 @@
+---
+title: "sce_pipeline"
+author: "Hinna"
+date: "2025-08-07"
+output: html_document
+---
+
+## 1. 加载包
+```{R}
+library(SingleCellExperiment)
+library(DropletUtils)
+library(scuttle)
+library(scater)
+library(scran)
+library(igraph)
+library(ggsc)
+library(aplot)
+```
+
+## 加载数据
+```{R}
+## 还是Seurat的10X PBMC数据
+dir <- "E:/pbmc/filtered_gene_bc_matrices/hg19/"
+sce <- DropletUtils::read10xCounts(samples = dir)
+rownames(sce) <- scuttle::uniquifyFeatureNames(
+        rowData(sce)$ID, rowData(sce)$Symbol)
+```
+
+```{r}
+sce
+```
+
+
+## QC
+```{r}
+## 计算QC指标
+qc_metrics <- scuttle::perCellQCMetrics(sce)
+colData(sce)$nFeature_RNA <- qc_metrics$detected
+colData(sce)$nCount_RNA <- qc_metrics$sum
+
+mito_pattern <- grepl("^MT-", rownames(sce))
+mito <- scuttle::perCellQCMetrics(sce, subsets = list(pattern=mito_pattern))
+sce[["percent.mt"]] <- mito$subsets_pattern_percent
+
+features <- c("nFeature_RNA", "nCount_RNA", "percent.mt")
+
+pp <- lapply(features, function(y) {
+  ggplot(colData(sce), aes(x = factor(1), y = !!rlang::sym(y))) +
+    ggtitle(y) +
+    geom_violin(fill = "lightblue", color = "black") +
+    geom_jitter(color = 'black', size = 0.1, width = 0.4) +
+    theme_classic() +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    ) +
+    xlab(NULL) +
+    ylab(NULL)
+})
+
+aplot::plot_list(gglist = pp, ncol = 3)
+
+## QC过滤
+sce <- sce[Matrix::rowSums(counts(sce) > 0) >= 3, ]
+sce <- sce[sce$nCount_RNA >= 200, ]
+sce <- sce[, sce$nFeature_RNA > 200 & sce$nFeature_RNA < 2500 & sce$percent.mt < 5]
+sce
+```
+
+## Normalization
+```{R}
+sce <- logNormCounts(sce)
+sce
+```
+
+## feature selection
+```{r}
+dec <- scran::modelGeneVar(sce)
+hvg <- scran::getTopHVGs(dec, prop=0.1)
+top10 <- head(hvg, 10)
+top10
+```
+
+## PCA
+```{r}
+# scaling
+mat <- t(logcounts(sce))
+m <- Matrix::rowMeans(mat)
+s <- apply(mat, 1, stats::sd)
+s[s == 0] <- 0.01
+SummarizedExperiment::assay(sce, "scaled") <- Matrix::t((mat - m) / s) 
+
+# PCA
+set.seed(2025)
+sce <- scater::runPCA(sce, subset_row = hvg, exprs_values = "scaled")
+
+## elbow-plot
+pca_results <- reducedDim(sce, "PCA")
+v <- attr(pca_results, "percentVar")
+d <- data.frame(PC = seq_along(v), var = v)
+
+ggplot(d, aes(x = PC, y = var)) +
+  geom_point() +
+  ylab("Standard Deviation") +
+  theme_classic()
+```
+
+## clustering and visualization
+```{R}
+## build graph
+reducedDim(sce, ".dimred") <- reducedDim(sce, "PCA")[, 1:10]
+knn_graph <- scran::buildSNNGraph(sce, use.dimred = ".dimred", k = 10, type = "rank")
+metadata(sce)$knn_graph <- knn_graph
+
+## Louvain clustering
+g <- metadata(sce)$knn_graph
+clusters <- igraph::cluster_louvain(g, resolution = 0.7)
+colLabels(sce) <- factor(clusters$membership)
+t <- setNames(colData(sce)$label, colData(sce)$Barcode)
+head(t, 10)
+
+## UMAP
+sce <- scater::runUMAP(sce, dimred = ".dimred")
+
+## visualization
+p4 <- ggsc::sc_dim(sce, reduction="PCA")
+p5 <- ggsc::sc_dim(sce, reduction="UMAP")
+
+plot_list(gglist = list(PCA=p4, UMAP=p5))
+```
+
+## find markers
+```{r}
+markers <- scran::findMarkers(sce, test.type="wilcox", direction="up", lfc=1)
+markers[[1]] |> head(5)
+```
+
+
