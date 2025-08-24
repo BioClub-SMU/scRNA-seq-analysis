@@ -1,0 +1,357 @@
+---
+title: "scATAC-seq"
+author: "Hinna"
+date: "2025-08-02"
+output: html_document
+---
+
+## scATAC-seq分析流程(Signac)版本
+
+### 加载数据和包
+```{R}
+# install.packages("Signac")
+# install.packages("hdf5r")
+library(Signac)
+library(Seurat)
+library(GenomicRanges)
+library(ggplot2)
+library(patchwork)
+```
+
+## 1.1 读取数据
+```{r}
+## cells x peaks 表达矩阵
+counts <- Read10X_h5(filename ="./demo_data/10k_pbmc_ATACv2_nextgem_Chromium_Controller_filtered_peak_bc_matrix.h5")
+
+## 细胞注释信息
+metadata <- read.csv(
+ file ="./demo_data/10k_pbmc_ATACv2_nextgem_Chromium_Controller_singlecell.csv",
+ header =TRUE,
+ row.names =1
+)
+
+# counts[1:5, 1:5]
+
+## 创建atac分析对象(提前对peak和细胞进行过滤)
+chrom_assay <- CreateChromatinAssay(
+ counts = counts,
+ sep = c(":","-"),
+ fragments = "./demo_data/10k_pbmc_ATACv2_nextgem_Chromium_Controller_fragments.tsv.gz",
+ min.cells = 10, # 过滤peaks
+ min.features = 200 # 过滤细胞
+)
+
+## 生成seurat对象
+pbmc <- CreateSeuratObject(
+ counts = chrom_assay,
+ assay = "peaks",
+ meta.data = metadata
+)
+
+## 查看信息
+pbmc
+pbmc[["peaks"]]
+granges(pbmc) # 查看基因组范围
+```
+peaks的信息存储在`granges(pbmc)`中(一个`GRanges`对象)，记录每个peak的染色体、位置等信息）。
+
+
+## 1.2 处理注释信息
+```{r}
+## 去除非染色体序列的部分
+standardChromosomes(granges(pbmc))
+seqnames(granges(pbmc))
+
+peaks.keep <- seqnames(granges(pbmc)) %in% standardChromosomes(granges(pbmc))
+table(peaks.keep)
+pbmc <- pbmc[as.vector(peaks.keep), ]
+pbmc
+
+## 添加基因注释信息
+library(AnnotationHub)
+# ah <- AnnotationHub()
+save(ah, file ="ah.RData") # 保存以便下次使用
+load("./ah.RData")
+
+# Search for the Ensembl 98 EnsDb for Homo sapiens on AnnotationHub
+query(ah,"EnsDb.Hsapiens.v98")
+ensdb_v98 <- ah[["AH75011"]]
+
+# extract gene annotations from EnsDb(这里需要一个包`biovizBase`)
+# BiocManager::install("biovizBase") ## 无法安装
+# 改用源码安装
+install.packages("./new_pkg/biovizBase_1.56.0.zip", repos = NULL, type = "win.binary")
+# 然后发现有个包需要补装
+# BiocManager::install("VariantAnnotation")
+install.packages("./new_pkg/VariantAnnotation_1.54.1.zip", repos = NULL, type = "win.binary")
+# BiocManager::install("BSgenome")
+install.packages("./new_pkg/BSgenome_1.76.0.zip", repos = NULL, type = "win.binary")
+
+annotations <- GetGRangesFromEnsDb(ensdb = ensdb_v98)
+
+# change to UCSC style since the data was mapped to hg38
+seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+genome(annotations) <-"hg38"
+
+# 将基因信息添加到对象中
+Annotation(pbmc) <- annotations
+```
+`AnnotationHub` 是 `Bioconductor` 提供的一个云端注释数据库接口，可以访问很多基因组注释数据（如 GTF/GFF、Ensembl、UCSC 等）。这一步将基因注释信息绑定到pbmc对象中，方便后续建立peak和基因的关系。
+
+
+## 2. QC
+# 计算QC指标
+核小体信号得分：染色质中带有核小体的片段（长片段）相对于无核小体的开放区域片段（短片段）的比例。
+核小体信号越低，说明染色质越开放，更能反映真正的调控区域
+```{r}
+# 计算每个细胞核小体信号得分
+pbmc <- NucleosomeSignal(object = pbmc)
+
+# 计算每个细胞的TSS富集得分
+pbmc <- TSSEnrichment(object = pbmc)
+
+# add fraction of reads in peaks
+pbmc$pct_reads_in_peaks <- pbmc$peak_region_fragments / pbmc$passed_filters * 100
+
+# add blacklist ratio
+pbmc$blacklist_ratio <- FractionCountsInRegion(
+  object = pbmc, 
+  assay = 'peaks',
+  regions = blacklist_hg38_unified
+)
+
+## 可视化
+DensityScatter(pbmc, x = 'nCount_peaks', y = 'TSS.enrichment', log_x = TRUE, quantiles = TRUE)
+pbmc$nucleosome_group <- ifelse(pbmc$nucleosome_signal > 4, 'NS > 4', 'NS < 4')
+FragmentHistogram(object = pbmc, group.by = 'nucleosome_group')
+
+## 可视化qc指标分布情况
+VlnPlot(
+  object = pbmc,
+  features = c('nCount_peaks', 'TSS.enrichment', 'blacklist_ratio', 'nucleosome_signal', 'pct_reads_in_peaks'),
+  pt.size = 0.1,
+  ncol = 5
+)
+
+## 过滤
+pbmc <- subset(
+  x = pbmc,
+  subset = nCount_peaks > 9000 &
+    nCount_peaks < 100000 &
+    pct_reads_in_peaks > 40 &
+    blacklist_ratio < 0.01 &
+    nucleosome_signal < 4 &
+    TSS.enrichment > 4
+)
+pbmc
+```
+
+
+## 3. 标准化
+```{r}
+## 将原始counts矩阵转换为 TF-IDF 标准化矩阵
+pbmc <- RunTFIDF(pbmc)
+
+## 选择高变 peak，降低维度，减少噪声
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 'q0') ## q0表示保留所有 peak（即没有过滤），在 SVD 时全部参与
+
+## 对TF-IDF标准化后的矩阵进行奇异值分解（SVD），即主成分分析的一个推广
+pbmc <- RunSVD(pbmc)
+
+## 评估维度与测序深度的相关性
+DepthCor(pbmc)
+```
+第一个 LSI 成分通常捕获测序深度（技术变异）而非生物学变异。如果情况如此，那么该成分应从下游分析中移除。
+
+
+## 4. 降维和聚类
+```{R}
+pbmc <- RunUMAP(object = pbmc, reduction = 'lsi', dims = 2:30) ## 不使用第一个维度
+pbmc <- FindNeighbors(object = pbmc, reduction = 'lsi', dims = 2:30)
+pbmc <- FindClusters(object = pbmc, verbose = FALSE, algorithm = 3)
+DimPlot(object = pbmc, label = TRUE) + NoLegend()
+```
+
+
+## 5. 构建基因活性矩阵
+通过评估与基因相关的染色质可及性来量化基因组中每个基因的活性
+```{R}
+gene.activities <- GeneActivity(pbmc)
+
+# add the gene activity matrix to the Seurat object as a new assay and normalize it
+pbmc[['RNA']] <- CreateAssayObject(counts = gene.activities)
+pbmc <- NormalizeData(
+  object = pbmc,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(pbmc$nCount_RNA)
+)
+
+
+## 可视化marker在cluster中的表达
+DefaultAssay(pbmc) <- 'RNA'
+
+FeaturePlot(
+  object = pbmc,
+  features = c('MS4A1', 'CD3D', 'LEF1', 'NKG7', 'TREM1', 'LYZ'),
+  pt.size = 0.1,
+  max.cutoff = 'q95',
+  ncol = 3
+)
+```
+
+
+## 6. 与单细胞转录组数据整合
+以scRNA-seq作为参考，以细胞为anchor，通过将scATAC和scRNA嵌入到相同维度的语义空间，
+去寻找对应配对的细胞，将scRNA的标签来注释scATAC中的细胞群
+```{r}
+# Load the pre-processed scRNA-seq data for PBMCs
+pbmc_rna <- readRDS("./demo_data/pbmc_10k_v3.rds")
+pbmc_rna <- UpdateSeuratObject(pbmc_rna)
+
+transfer.anchors <- FindTransferAnchors(
+  reference = pbmc_rna,
+  query = pbmc,
+  reduction = 'cca'
+)
+
+predicted.labels <- TransferData(
+  anchorset = transfer.anchors,
+  refdata = pbmc_rna$celltype,
+  weight.reduction = pbmc[['lsi']],
+  dims = 2:30
+)
+
+pbmc <- AddMetaData(object = pbmc, metadata = predicted.labels)
+
+## 可视化
+p1 <- DimPlot(
+  object = pbmc_rna,
+  group.by = 'celltype',
+  label = TRUE,
+  repel = TRUE) + NoLegend() + ggtitle('scRNA-seq')
+
+p2 <- DimPlot(
+  object = pbmc,
+  group.by = 'predicted.id',
+  label = TRUE,
+  repel = TRUE) + NoLegend() + ggtitle('scATAC-seq')
+
+p1 + p2
+
+## 探究血小板细胞
+VlnPlot(pbmc, 'prediction.score.max', group.by = 'predicted.id') # 发现血小板得分较低
+
+## 提取每种细胞的预测打分
+# Identify the metadata columns that start with "prediction.score."
+metadata_attributes <- colnames(pbmc[[]])
+prediction_score_attributes <- grep("^prediction.score.", metadata_attributes, value = TRUE)
+prediction_score_attributes <- setdiff(prediction_score_attributes, "prediction.score.max")
+
+# Extract the prediction score attributes for these cells
+predicted_platelets <- which(pbmc$predicted.id == "Platelet")
+platelet_scores <- pbmc[[]][predicted_platelets, prediction_score_attributes]
+
+# Order the columns by their average values in descending order
+ordered_columns <- names(sort(colMeans(platelet_scores, na.rm = TRUE), decreasing = TRUE))
+ordered_platelet_scores_df <- platelet_scores[, ordered_columns]
+
+print(ordered_platelet_scores_df)
+
+predicted_id_counts <- table(pbmc$predicted.id)
+
+# Identify the predicted.id values that have more than 20 cells
+major_predicted_ids <- names(predicted_id_counts[predicted_id_counts > 20])
+pbmc <- pbmc[, pbmc$predicted.id %in% major_predicted_ids]
+
+# change cell identities to the per-cell predicted labels
+Idents(pbmc) <- pbmc$predicted.id
+```
+
+
+## 7. 细胞类型差异peaks分析
+为了找到细胞亚群之间的差异可及性区域，我们可以进行差异可及性（DA）检验。一种简单的方法是执行Wilcoxon秩和检验，而presto包已经实现了一种极其快速的Wilcoxon检验，可以直接在Seurat对象上运行。
+```{R}
+# change back to working with peaks instead of gene activities
+DefaultAssay(pbmc) <- 'peaks'
+
+# wilcox is the default option for test.use
+da_peaks <- FindMarkers(
+  object = pbmc,
+  ident.1 = "CD4 Naive",
+  ident.2 = "CD14+ Monocytes",
+  test.use = 'wilcox',
+  min.pct = 0.1
+)
+head(da_peaks)
+
+## Logistic regression with total fragment number as the latent variable
+# Use logistic regression, set total fragment no. as latent var
+#lr_da_peaks <- FindMarkers(
+  #object = pbmc,
+  #ident.1 = "CD4 Naive",
+  #ident.2 = "CD14+ Monocytes",
+  #test.use = 'LR',
+  #latent.vars = 'nCount_peaks',  ## 用片段数作为协变量进行逻辑回归调整
+  #min.pct = 0.1
+#)
+#head(lr_da_peaks)
+  
+
+## 挑选一个peak来可视化
+p3 <- VlnPlot(
+  object = pbmc,
+  features = rownames(da_peaks)[1],
+  pt.size = 0.1,
+  idents = c("CD4 Naive","CD14+ Monocytes")
+)
+p4 <- FeaturePlot(
+  object = pbmc,
+  features = rownames(da_peaks)[1],
+  pt.size = 0.1
+)
+
+p3 | p4
+
+
+## 对peak进行注释，与邻近基因进行关联
+open_cd4naive <- rownames(da_peaks[da_peaks$avg_log2FC > 3, ])
+open_cd14mono <- rownames(da_peaks[da_peaks$avg_log2FC < -3, ])
+
+closest_genes_cd4naive <- ClosestFeature(pbmc, regions = open_cd4naive)
+closest_genes_cd14mono <- ClosestFeature(pbmc, regions = open_cd14mono)
+
+head(closest_genes_cd4naive)
+head(closest_genes_cd14mono)
+```
+
+
+## 8. 绘制基因区域
+```{R}
+## 排序
+pbmc <- SortIdents(pbmc)
+
+# find DA peaks overlapping gene of interest
+regions_highlight <- subsetByOverlaps(StringToGRanges(open_cd4naive), LookupGeneCoords(pbmc, "CD4"))
+
+CoveragePlot(
+  object = pbmc,
+  region = "CD4",
+  region.highlight = regions_highlight,
+  extend.upstream = 1000,
+  extend.downstream = 1000
+)
+
+regions_highlight <- subsetByOverlaps(StringToGRanges(open_cd14mono), LookupGeneCoords(pbmc, "LYZ"))
+
+CoveragePlot(
+  object = pbmc,
+  region = "LYZ",
+  region.highlight = regions_highlight,
+  extend.upstream = 1000,
+  extend.downstream = 5000
+)
+```
+
+
+
